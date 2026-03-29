@@ -1,53 +1,64 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
-// ─── Pitch Detection (Autocorrelation) ─────────────────────────────────────
-function autoCorrelate(buf, sampleRate) {
+// ─── Pitch Detection (YIN algorithm) ──────────────────────────────────────
+function yinDetect(buf, sampleRate) {
   const SIZE = buf.length;
+  const halfSize = Math.floor(SIZE / 2);
+
+  // RMS gate
   let rms = 0;
   for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / SIZE);
   if (rms < 0.015) return null;
 
-  let r1 = 0,
-    r2 = SIZE - 1;
-  const thresh = 0.2;
-  for (let i = 0; i < SIZE / 2; i++) {
-    if (Math.abs(buf[i]) < thresh) {
-      r1 = i;
+  // Step 1: difference function
+  const d = new Float32Array(halfSize);
+  for (let tau = 1; tau < halfSize; tau++) {
+    for (let j = 0; j < halfSize; j++) {
+      const delta = buf[j] - buf[j + tau];
+      d[tau] += delta * delta;
+    }
+  }
+
+  // Step 2: cumulative mean normalised difference
+  const cmnd = new Float32Array(halfSize);
+  cmnd[0] = 1;
+  let runningSum = 0;
+  for (let tau = 1; tau < halfSize; tau++) {
+    runningSum += d[tau];
+    cmnd[tau] = runningSum === 0 ? 0 : d[tau] * tau / runningSum;
+  }
+
+  // Step 3: absolute threshold — find first tau where cmnd < 0.15
+  const threshold = 0.15;
+  // Min lag corresponds to ~2000 Hz, max to ~60 Hz
+  const minTau = Math.floor(sampleRate / 2000);
+  const maxTau = Math.floor(sampleRate / 60);
+  let tau = minTau;
+  while (tau < maxTau) {
+    if (cmnd[tau] < threshold) {
+      // Find the local minimum in this dip
+      while (tau + 1 < maxTau && cmnd[tau + 1] < cmnd[tau]) tau++;
       break;
     }
+    tau++;
   }
-  for (let i = 1; i < SIZE / 2; i++) {
-    if (Math.abs(buf[SIZE - i]) < thresh) {
-      r2 = SIZE - i;
-      break;
-    }
+  if (tau >= maxTau || cmnd[tau] >= threshold) return null;
+
+  // Step 4: parabolic interpolation for sub-sample accuracy
+  const x0 = tau > 1 ? tau - 1 : tau;
+  const x2 = tau + 1 < halfSize ? tau + 1 : tau;
+  let betterTau;
+  if (x0 === tau) {
+    betterTau = cmnd[tau] <= cmnd[x2] ? tau : x2;
+  } else if (x2 === tau) {
+    betterTau = cmnd[tau] <= cmnd[x0] ? tau : x0;
+  } else {
+    const denom = 2 * (2 * cmnd[tau] - cmnd[x0] - cmnd[x2]);
+    betterTau = denom === 0 ? tau : tau + (cmnd[x2] - cmnd[x0]) / denom;
   }
 
-  const b = buf.slice(r1, r2);
-  const c = new Float32Array(b.length).fill(0);
-  for (let i = 0; i < b.length; i++)
-    for (let j = 0; j < b.length - i; j++) c[i] += b[j] * b[j + i];
-
-  let d = 0;
-  while (c[d] > c[d + 1]) d++;
-  let maxval = -1,
-    maxpos = -1;
-  for (let i = d; i < b.length; i++) {
-    if (c[i] > maxval) {
-      maxval = c[i];
-      maxpos = i;
-    }
-  }
-  if (maxpos < 1) return null;
-
-  const x1 = c[maxpos - 1],
-    x2 = c[maxpos],
-    x3 = maxpos + 1 < c.length ? c[maxpos + 1] : x2;
-  const a = (x1 + x3 - 2 * x2) / 2;
-  const b2 = (x3 - x1) / 2;
-  const T0 = a ? maxpos - b2 / (2 * a) : maxpos;
-  return sampleRate / T0;
+  return sampleRate / betterTau;
 }
 
 // ─── Note / Swara Mapping ──────────────────────────────────────────────────
@@ -110,6 +121,7 @@ export default function RaagaShazam() {
   const [elapsed, setElapsed] = useState(0);
   const [bars, setBars] = useState(Array(32).fill(2));
   const [permError, setPermError] = useState(false);
+  const [canEarlyAnalyze, setCanEarlyAnalyze] = useState(false);
 
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
@@ -117,14 +129,23 @@ export default function RaagaShazam() {
   const streamRef = useRef(null);
   const rafRef = useRef(null);
   const timerRef = useRef(null);
-  const swaraHistoryRef = useRef([]);
+  const pitchLogTimerRef = useRef(null);
+  // Stable-region extraction state
+  const stableWindowRef = useRef([]); // recent pitch readings in cents from Sa for stability check
+  const stableStartTimeRef = useRef(null); // timestamp when current stable region started
+  const lastStableSemitoneRef = useRef(null); // semitone index of the candidate stable swara
   const detectedSetRef = useRef(new Set());
   const elapsedRef = useRef(0);
-  const MAX_LISTEN = 10;
+  // Pitch time-series: one entry per 100ms tick — null if no pitch, else semitones from Sa
+  const pitchTimeSeriesRef = useRef([]);
+  const currentPitchRef = useRef(null); // latest detected pitch in semitones (fractional)
+  const MAX_LISTEN = 25;
+  const EARLY_ANALYZE_MIN_SWARAS = 4;
 
   const stopListening = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     clearInterval(timerRef.current);
+    clearInterval(pitchLogTimerRef.current);
     if (sourceRef.current) {
       try {
         sourceRef.current.disconnect();
@@ -156,11 +177,27 @@ export default function RaagaShazam() {
         const s = SWARAS.find((sw) => sw.id === id);
         return `${s.name} (${s.label})`;
       });
-      const prompt = `I recorded a melody in Indian classical music. The Sa (tonic) is set to ${sa}. The following swaras were detected in this session: ${swaraList.join(
-        ', '
-      )}.
 
-Based on this swara set, identify the most likely Indian classical raaga. Consider Hindustani tradition primarily.
+      // Pitch time-series: compact array of semitone values (null → silence/unstable)
+      const timeSeries = pitchTimeSeriesRef.current;
+      const timeSeriesStr = timeSeries
+        .map((v) => (v === null ? 'null' : v.toFixed(2)))
+        .join(', ');
+
+      const prompt = `I recorded a melody in Indian classical music. The Sa (tonic) is set to ${sa}.
+
+STABLE SWARAS DETECTED (held steadily for ≥120ms, variance <30 cents): ${swaraList.join(', ')}
+
+PITCH TIME-SERIES (semitones from Sa, one value per 100ms, null = silence/glide):
+[${timeSeriesStr}]
+
+Using both the stable swara set AND the pitch contour above, identify the most likely Indian classical raaga. Consider Hindustani tradition primarily.
+
+In your analysis, reason about:
+- Melodic contour: does the pitch move stepwise, in leaps, with oscillations?
+- Characteristic phrases: any recognisable sequences visible in the time-series?
+- Gamaka patterns: look for rapid oscillations, meend (glides), andolan (slow oscillation) around a swara
+- Vadi/samvadi emphasis: which semitones recur most or are approached/left in distinctive ways?
 
 Respond ONLY with this exact JSON, no extra text or markdown:
 {
@@ -207,9 +244,14 @@ Respond ONLY with this exact JSON, no extra text or markdown:
     setDetectedSwaras([]);
     setCurrentSwara(null);
     setElapsed(0);
+    setCanEarlyAnalyze(false);
     elapsedRef.current = 0;
     detectedSetRef.current = new Set();
-    swaraHistoryRef.current = [];
+    stableWindowRef.current = [];
+    stableStartTimeRef.current = null;
+    lastStableSemitoneRef.current = null;
+    pitchTimeSeriesRef.current = [];
+    currentPitchRef.current = null;
     setPermError(false);
 
     try {
@@ -232,6 +274,24 @@ Respond ONLY with this exact JSON, no extra text or markdown:
       const freqBuf = new Uint8Array(analyser.frequencyBinCount);
       const saFreq = SA_FREQS[sa];
 
+      // Convert a frequency to continuous semitones from Sa (fractional, multi-octave normalized)
+      const freqToSemitones = (freq) => {
+        if (!freq || freq < 60 || freq > 2000) return null;
+        let saRef = saFreq;
+        while (saRef * 2 < freq) saRef *= 2;
+        while (saRef > freq * 1.5) saRef /= 2;
+        return 12 * Math.log2(freq / saRef);
+      };
+
+      // ── Pitch time-series logger: fires every 100ms ──────────────────────
+      pitchLogTimerRef.current = setInterval(() => {
+        pitchTimeSeriesRef.current.push(currentPitchRef.current);
+      }, 100);
+
+      // ── RAF tick: pitch detection + stable-region extraction ─────────────
+      const STABLE_DURATION_MS = 120;
+      const STABLE_VARIANCE_CENTS = 30;
+
       const tick = () => {
         analyser.getFloatTimeDomainData(buf);
         analyser.getByteFrequencyData(freqBuf);
@@ -245,31 +305,63 @@ Respond ONLY with this exact JSON, no extra text or markdown:
           })
         );
 
-        // Pitch detect
-        const freq = autoCorrelate(buf, ctx.sampleRate);
-        const swara = freq ? freqToSwara(freq, saFreq) : null;
+        // YIN pitch detection
+        const freq = yinDetect(buf, ctx.sampleRate);
+        const semitones = freq ? freqToSemitones(freq) : null;
 
-        if (swara) {
-          swaraHistoryRef.current.push(swara.id);
-          if (swaraHistoryRef.current.length > 6)
-            swaraHistoryRef.current.shift();
-          // Majority vote over last 6 frames
-          const counts = {};
-          swaraHistoryRef.current.forEach((id) => {
-            counts[id] = (counts[id] || 0) + 1;
-          });
-          const stable = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-          if (stable && stable[1] >= 4) {
-            const stableSwara = SWARAS.find((s) => s.id === stable[0]);
-            setCurrentSwara(stableSwara);
-            if (!detectedSetRef.current.has(stable[0])) {
-              detectedSetRef.current.add(stable[0]);
-              setDetectedSwaras((prev) => [...prev, stable[0]]);
+        // Update live pitch ref for time-series logging
+        currentPitchRef.current = semitones !== null ? parseFloat(semitones.toFixed(2)) : null;
+
+        // ── Stable-region extraction ──────────────────────────────────────
+        if (semitones !== null) {
+          const candidateSemitone = Math.round(semitones);
+          const now = performance.now();
+
+          // Check if this reading belongs to the same candidate swara
+          if (candidateSemitone !== lastStableSemitoneRef.current) {
+            // New candidate — reset window
+            lastStableSemitoneRef.current = candidateSemitone;
+            stableWindowRef.current = [semitones];
+            stableStartTimeRef.current = now;
+          } else {
+            stableWindowRef.current.push(semitones);
+
+            // Compute variance in cents (100 cents = 1 semitone)
+            const vals = stableWindowRef.current;
+            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            const variance =
+              vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
+            const stdCents = Math.sqrt(variance) * 100;
+
+            if (
+              stdCents < STABLE_VARIANCE_CENTS &&
+              now - stableStartTimeRef.current >= STABLE_DURATION_MS
+            ) {
+              // Stable swara confirmed
+              const normSemitone = ((candidateSemitone % 12) + 12) % 12;
+              const stableSwara = SWARAS.find((s) => s.semitone === normSemitone);
+              if (stableSwara) {
+                setCurrentSwara(stableSwara);
+                if (!detectedSetRef.current.has(stableSwara.id)) {
+                  detectedSetRef.current.add(stableSwara.id);
+                  setDetectedSwaras((prev) => {
+                    const next = [...prev, stableSwara.id];
+                    if (next.length >= EARLY_ANALYZE_MIN_SWARAS)
+                      setCanEarlyAnalyze(true);
+                    return next;
+                  });
+                }
+              }
             }
           }
         } else {
+          // Silence — reset stable window
+          stableWindowRef.current = [];
+          stableStartTimeRef.current = null;
+          lastStableSemitoneRef.current = null;
           setCurrentSwara(null);
         }
+
         rafRef.current = requestAnimationFrame(tick);
       };
       rafRef.current = requestAnimationFrame(tick);
@@ -298,8 +390,13 @@ Respond ONLY with this exact JSON, no extra text or markdown:
     setResult(null);
     setError(null);
     setElapsed(0);
+    setCanEarlyAnalyze(false);
     detectedSetRef.current = new Set();
-    swaraHistoryRef.current = [];
+    stableWindowRef.current = [];
+    stableStartTimeRef.current = null;
+    lastStableSemitoneRef.current = null;
+    pitchTimeSeriesRef.current = [];
+    currentPitchRef.current = null;
   };
 
   useEffect(() => () => stopListening(), [stopListening]);
@@ -643,12 +740,41 @@ Respond ONLY with this exact JSON, no extra text or markdown:
               <div
                 style={{
                   marginTop: 14,
-                  color: '#ff8c32',
-                  fontSize: '0.78rem',
-                  letterSpacing: '0.06em',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  gap: 10,
                 }}
               >
-                Listening… {MAX_LISTEN - elapsed}s left
+                <div
+                  style={{
+                    color: '#ff8c32',
+                    fontSize: '0.78rem',
+                    letterSpacing: '0.06em',
+                  }}
+                >
+                  Listening… {MAX_LISTEN - elapsed}s left
+                </div>
+                {canEarlyAnalyze && (
+                  <button
+                    onClick={analyze}
+                    style={{
+                      padding: '7px 20px',
+                      background: 'rgba(100,121,255,0.12)',
+                      border: '1px solid rgba(100,121,255,0.4)',
+                      borderRadius: 20,
+                      cursor: 'pointer',
+                      color: '#6479ff',
+                      fontSize: '0.75rem',
+                      fontFamily: "'DM Sans', sans-serif",
+                      fontWeight: 500,
+                      letterSpacing: '0.06em',
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    Analyze now ↗
+                  </button>
+                )}
               </div>
             )}
           </div>
